@@ -1,0 +1,571 @@
+-- python_interface.lua (Version 15 - Direct Global Graphics Calls)
+
+-- GetInfo, local variable declarations, Initialize, Update, Shutdown,
+-- and helper functions (TryConnect, SendToPython, ReceiveFromPython, ProcessCommand)
+-- REMAIN THE SAME AS IN VERSION 14.
+-- Only DrawScreen is modified below:
+
+-- ... (Keep all code from V14 above this point) ...
+
+function GetInfo() -- Must be global for engine discovery
+  Spring.Echo("[V15] Global GetInfo() called!")
+  return {
+    name      = "Python GA Interface V15",
+    desc      = "Communicates with Python GA. V15",
+    author    = "AI & You",
+    date      = "Today",
+    license   = "GPLv2",
+    layer     = 0,
+    enabled   = true
+  }
+end
+
+-- Declare module-level locals for state
+local socket_lib = nil 
+local json_lib = nil  
+
+local client = nil
+local teamID = 0 
+local host = "127.0.0.1"
+local port = 12345 
+local last_error = "Not connected"
+local connect_retry_interval = 150 
+local last_connect_attempt_frame = -connect_retry_interval
+
+
+local function InitializeLogic(gadget_instance) 
+  Spring.Echo("Python Interface (V15): InitializeLogic running...")
+
+  if socket and type(socket.tcp) == "function" then 
+    socket_lib = socket
+    Spring.Echo("Python Interface (V15): Successfully assigned global 'socket' library.")
+  else
+    Spring.Log("Python Interface (V15)", LOG.ERROR, "Global 'socket' library NOT found. Network ops will fail.")
+    last_error = "Socket Lib Missing!"
+  end
+
+  local json_script_path = "LuaUI/Widgets/json.lua"
+  local vfs_success, loaded_json_module = pcall(VFS.Include, json_script_path)
+
+  if vfs_success and type(loaded_json_module) == "table" then
+    json_lib = loaded_json_module
+    Spring.Echo("Python Interface (V15): VFS.Included json.lua from: " .. json_script_path)
+    if not (json_lib.encode and json_lib.decode) then
+        Spring.Log("Python Interface (V15)", LOG.ERROR, "json.lua missing encode/decode.")
+        json_lib = nil; if last_error == "Not connected" or last_error == "Socket lib missing" then last_error = "JSON Lib Missing!" end
+    end
+  else
+    Spring.Log("Python Interface (V15)", LOG.WARNING, "Failed VFS.Include json.lua: " .. (tostring(loaded_json_module) or "err"))
+    if _G and _G.json and type(_G.json.encode) == "function" then json_lib = _G.json; Spring.Echo("Python Interface (V15): Using global JSON fallback.")
+    else Spring.Log("Python Interface (V15)", LOG.ERROR, "JSON Lib unavailable."); if last_error == "Not connected" or last_error == "Socket lib missing" then last_error = "JSON Lib Missing!" end
+    end
+  end
+  
+  teamID = Spring.GetMyTeamID()
+  Spring.Echo("Python Interface (V15): teamID set to " .. tostring(teamID))
+  last_connect_attempt_frame = Spring.GetGameFrame()
+end
+
+function Initialize(self) 
+  Spring.Echo("[V15] gadget:Initialize() called. Type of self: " .. type(self))
+  InitializeLogic(self)
+end
+
+-- Local helper functions (TryConnect, SendToPython, ReceiveFromPython, ProcessCommand)
+-- Define these before Update calls them.
+-- They use socket_lib and json_lib.
+
+function TryConnect()
+  if not socket_lib then
+    last_error = "Socket library not available for connect!"
+    return false
+  end
+  if client then pcall(function() client:close() end); client = nil end
+  client = socket_lib.tcp() 
+  if not client then 
+      last_error = "socket_lib.tcp() failed"
+      Spring.Log("Python Interface (V15)", LOG.ERROR, last_error)
+      return false
+  end
+  client:settimeout(0.5)
+  Spring.Echo("Python Interface (V15): Attempting to connect to " .. host .. ":" .. port)
+  local success, err = client:connect(host, port)
+  if success then
+    Spring.Echo("Python Interface (V15): Connected to Python GA server!")
+    client:settimeout(0); last_error = ""; return true
+  else
+    last_error = "Connect err: " .. (tostring(err) or "timeout")
+    if client and client.close then pcall(function() client:close() end) end; client = nil; return false
+  end
+end
+
+function SendToPython(message_object)
+  if not client then return false, "Not connected" end
+  if not json_lib or not json_lib.encode then
+    Spring.Log("Python Interface (V15)", LOG.ERROR, "json_lib.encode not available."); return false, "JSON encode not available"
+  end
+  local success_encode, message_str = pcall(json_lib.encode, message_object)
+  if not success_encode then
+    Spring.Log("Python Interface (V15)", LOG.ERROR, "JSON encode failed: " .. (message_str or "err")); return false, "JSON encode failed"
+  end
+  local success_send, err_send = client:send(message_str .. "\n") 
+  if not success_send then
+    Spring.Log("Python Interface (V15)", LOG.WARNING, "Send Error: " .. (err_send or "err")); last_error = "Send err: " .. (err_send or "err"); if client and client.close then pcall(function() client:close() end); end; client = nil; return false, err_send
+  end
+  return true
+end
+
+function ReceiveFromPython()
+  if not client then return nil, "Not connected" end
+  if not json_lib or not json_lib.decode then
+    Spring.Log("Python Interface (V15)", LOG.ERROR, "json_lib.decode not available."); return nil, "JSON decode not available"
+  end
+  local line, err = client:receive("*l") 
+  if err == "timeout" then return nil, "timeout" 
+  elseif err then Spring.Log("Python Interface (V15)", LOG.WARNING, "Recv Error: " .. err); last_error = "Recv err: " .. err; if client and client.close then pcall(function() client:close() end); end; client = nil; return nil, err
+  elseif not line then Spring.Log("Python Interface (V15)", LOG.WARNING, "Connection closed by Python."); last_error = "Recv err: closed"; if client and client.close then pcall(function() client:close() end); end; client = nil; return nil, "closed"
+  end
+  local success_decode, decoded_data = pcall(json_lib.decode, line)
+  if not success_decode then
+    Spring.Log("Python Interface (V15)", LOG.WARNING, "JSON Decode Fail: '" .. line .. "' Err: " .. (decoded_data or "err")); return nil, "JSON decode failed"
+  end
+  return decoded_data
+end
+
+function ProcessCommand(cmd_data)
+  if type(cmd_data) ~= "table" then
+    Spring.Log("Python Interface (V15)", LOG.WARNING, "Received non-table command data."); SendToPython({status="error", message="Invalid command data type"}); return
+  end
+  local command = cmd_data.command; local params = cmd_data.params or {}
+  Spring.Echo("Python Interface (V15): Processing command: " .. (command or "nil"))
+  if command == "BUILD_UNIT" then
+    local unit_name, build_x, build_z = params.unit_name, params.x, params.y 
+    if not (unit_name and build_x and build_z) then SendToPython({status="error", message="Missing params for BUILD_UNIT"}); return end
+    local cmd_str = string.format("+buildunit %s %f %f %f", unit_name, build_x, 0, build_z)
+    Spring.SendCommands({cmd_str}); Spring.Echo("Python Interface (V15): Executed: " .. cmd_str); SendToPython({status="success", message="BUILD_UNIT command issued for " .. unit_name})
+  elseif command == "GET_STATE" then
+    local metal, energy, game_frame = Spring.GetTeamResources(teamID, "metal"), Spring.GetTeamResources(teamID, "energy"), Spring.GetGameFrame()
+    local game_time_seconds = game_frame / 30; local unit_counts = {}
+    local teamUnits = Spring.GetTeamUnits(teamID)
+    if teamUnits then for i=1, #teamUnits do local uid,udid=teamUnits[i],Spring.GetUnitDefID(uid) if udid then local ud=UnitDefs[udid] if ud then unit_counts[ud.name]=(unit_counts[ud.name]or 0)+1 end end end end
+    SendToPython({status="success",game_time=game_time_seconds,metal=metal,energy=energy,units=unit_counts})
+  else SendToPython({status="error", message="Unknown command: " .. (command or "nil")}) end
+end
+
+
+function Update(self)
+  -- (Same Update logic as V14, which calls TryConnect, ReceiveFromPython, ProcessCommand)
+  if Spring.GetGameFrame() % 300 == 1 then Spring.Echo("[V15] gadget:Update() ping. Frame: " .. Spring.GetGameFrame()) end
+  if not socket_lib or not json_lib then if Spring.GetGameFrame() % 301 == 0 then if not socket_lib then Spring.Log("Python Interface (V15)", LOG.ERROR, "Socket library unavailable.") end if not json_lib then Spring.Log("Python Interface (V15)", LOG.ERROR, "JSON library unavailable.") end end; return; end
+  if not client then if (Spring.GetGameFrame() - last_connect_attempt_frame) >= connect_retry_interval then TryConnect(); last_connect_attempt_frame = Spring.GetGameFrame(); end; return; end
+  local received_data, err = ReceiveFromPython(); if received_data then ProcessCommand(received_data) elseif err and err ~= "timeout" and err ~= "closed" then Spring.Log("Python Interface (V15)", LOG.WARNING, "Receive error: "..err); if client and client.close then client:close() end; client = nil; end
+end
+
+function Shutdown(self)
+  Spring.Echo("[V15] gadget:Shutdown() called.")
+  if client then client:close(); client = nil; end
+end
+
+-- MODIFIED DrawScreen
+function DrawScreen(self)
+  if Spring.GetGameFrame() % 300 == 5 then Spring.Echo("[V15] gadget:DrawScreen() ping.") end
+  
+  local screenX, screenY
+  local sX_raw, sY_raw
+  
+  -- Attempt to get screen size, first directly, then via Spring table
+  local success_getsize, result_getsize = pcall(GetScreenSize) -- Try global first
+  if success_getsize and type(result_getsize) == "number" then -- GetScreenSize might return multiple values
+      sX_raw = result_getsize
+      sY_raw = select(2, GetScreenSize()) -- Get the second return value
+      Spring.Echo("[V15] DrawScreen: Used global GetScreenSize().")
+  elseif Spring and Spring.GetScreenSize and type(Spring.GetScreenSize) == "function" then
+      success_getsize, sX_raw, sY_raw = pcall(Spring.GetScreenSize) -- Try Spring.GetScreenSize
+      if success_getsize then
+          Spring.Echo("[V15] DrawScreen: Used Spring.GetScreenSize().")
+      else
+          if Spring.GetGameFrame() % 301 == 0 then Spring.Log("Python Interface (V15)", LOG.WARNING, "Spring.GetScreenSize() call failed: " .. tostring(sX_raw)) end
+      end
+  else
+      if Spring.GetGameFrame() % 301 == 0 then Spring.Log("Python Interface (V15)", LOG.WARNING, "GetScreenSize and Spring.GetScreenSize are unavailable.") end
+  end
+
+  if sX_raw and sY_raw then
+      screenX, screenY = sX_raw, sY_raw
+  else
+      screenX, screenY = 800, 600 -- Fallback default
+      if Spring.GetGameFrame() % 301 == 0 then Spring.Log("Python Interface (V15)", LOG.WARNING, "DrawScreen using fallback screen dimensions.") end
+  end
+
+  local statusText = "Python GA (V15): Not Connected. " .. last_error
+  if client then 
+      statusText = "Python GA (V15): Connected (Lua)."
+  elseif not socket_lib then
+      statusText = "Python GA (V15): Socket Lib Missing!"
+  elseif not json_lib then
+      statusText = "Python GA (V15): JSON Lib Missing!"
+  end
+  
+  -- Try DrawText directly, then via Spring table
+  if DrawText and type(DrawText) == "function" then
+    pcall(DrawText, statusText, screenX * 0.02, screenY * 0.02, 16, "n")
+  elseif Spring and Spring.DrawText and type(Spring.DrawText) == "function" then
+    pcall(Spring.DrawText, statusText, screenX * 0.02, screenY * 0.02, 16, "n")
+  else
+    if Spring.GetGameFrame() % 301 == 0 then Spring.Log("Python Interface (V15)", LOG.WARNING, "DrawText and Spring.DrawText are unavailable.") end
+  end
+end
+
+Spring.Echo("[V15] End of python_interface.lua, all functions defined.")
+
+[t=01:22:21.964685][f=0000469] [V15] End of python_interface.lua, all functions defined.
+[t=01:22:21.964698][f=0000469] [V15] Global GetInfo() called!
+[t=01:22:21.964708][f=0000469] [V15] Global GetInfo() called!
+[t=01:22:21.964717][f=0000469] [V15] Global GetInfo() called!
+[t=01:22:21.964747][f=0000469] [V15] Global GetInfo() called!
+[t=01:22:21.964764][f=0000469] [V15] Global GetInfo() called!
+[t=01:22:21.965215][f=0000469] [V15] gadget:Initialize() called. Type of self: table
+[t=01:22:21.965226][f=0000469] Python Interface (V15): InitializeLogic running...
+[t=01:22:21.965233][f=0000469] Python Interface (V15): Successfully assigned global 'socket' library.
+[t=01:22:21.965743][f=0000469] Python Interface (V15): VFS.Included json.lua from: LuaUI/Widgets/json.lua
+[t=01:22:21.965758][f=0000469] Python Interface (V15): teamID set to 0
+[t=01:22:25.409101][f=0000469] ShadowS4 unpaused the game
+[t=01:22:29.769241][f=0000601] [V15] gadget:Update() ping. Frame: 601
+[t=01:22:29.785417][f=0000601] [V15] gadget:Update() ping. Frame: 601
+[t=01:22:29.805109][f=0000602] [Python Interface (V15)] Warning: GetScreenSize and Spring.GetScreenSize are unavailable.
+[t=01:22:29.805131][f=0000602] [Python Interface (V15)] Warning: DrawScreen using fallback screen dimensions.
+[t=01:22:29.805140][f=0000602] [Python Interface (V15)] Warning: DrawText and Spring.DrawText are unavailable.
+[t=01:22:29.821706][f=0000602] [Python Interface (V15)] Warning: GetScreenSize and Spring.GetScreenSize are unavailable.
+[t=01:22:29.821729][f=0000602] [Python Interface (V15)] Warning: DrawScreen using fallback screen dimensions.
+[t=01:22:29.821738][f=0000602] [Python Interface (V15)] Warning: DrawText and Spring.DrawText are unavailable.
+[t=01:22:29.905177][f=0000605] [V15] gadget:DrawScreen() ping.
+[t=01:22:29.921325][f=0000605] [V15] gadget:DrawScreen() ping.
+[t=01:22:29.937847][f=0000605] [V15] gadget:DrawScreen() ping.
+[t=01:22:30.369413][f=0000619] Python Interface (V15): Attempting to connect to 127.0.0.1:12345
+[t=01:22:31.135027][f=0000641] [VSync::SetInterval] interval=4 (standard)
+[t=01:22:35.420264][f=0000770] Python Interface (V15): Attempting to connect to 127.0.0.1:12345
+[t=01:22:39.786048][f=0000901] [V15] gadget:Update() ping. Frame: 901
+[t=01:22:39.855778][f=0000903] [Python Interface (V15)] Warning: GetScreenSize and Spring.GetScreenSize are unavailable.
+[t=01:22:39.855831][f=0000903] [Python Interface (V15)] Warning: DrawScreen using fallback screen dimensions.
+[t=01:22:39.855841][f=0000903] [Python Interface (V15)] Warning: DrawText and Spring.DrawText are unavailable.
+[t=01:22:39.923008][f=0000905] [V15] gadget:DrawScreen() ping.
+[t=01:22:40.435993][f=0000920] Python Interface (V15): Attempting to connect to 127.0.0.1:12345
+[t=01:22:41.457476][f=0000951] Input grabbing is enabled!
+[t=01:22:41.518992][f=0000951] [VSync::SetInterval] interval=-1 (adaptive)
+[t=01:22:45.402672][f=0001070] Python Interface (V15): Attempting to connect to 127.0.0.1:12345
+[t=01:22:47.501533][f=0001132] [VSync::SetInterval] interval=4 (standard)
+[t=01:22:49.468962][f=0001190] [VSync::SetInterval] interval=-1 (adaptive)
+[t=01:22:49.551972][f=0001194] Input grabbing is enabled!
+[t=01:22:49.769495][f=0001201] [V15] gadget:Update() ping. Frame: 1201
+[t=01:22:49.785467][f=0001201] [V15] gadget:Update() ping. Frame: 1201
+[t=01:22:49.871786][f=0001204] [Python Interface (V15)] Warning: GetScreenSize and Spring.GetScreenSize are unavailable.
+[t=01:22:49.871832][f=0001204] [Python Interface (V15)] Warning: DrawScreen using fallback screen dimensions.
+[t=01:22:49.871841][f=0001204] [Python Interface (V15)] Warning: DrawText and Spring.DrawText are unavailable.
+[t=01:22:49.888007][f=0001204] [Python Interface (V15)] Warning: GetScreenSize and Spring.GetScreenSize are unavailable.
+[t=01:22:49.888028][f=0001204] [Python Interface (V15)] Warning: DrawScreen using fallback screen dimensions.
+[t=01:22:49.888057][f=0001204] [Python Interface (V15)] Warning: DrawText and Spring.DrawText are unavailable.
+[t=01:22:49.904661][f=0001204] [Python Interface (V15)] Warning: GetScreenSize and Spring.GetScreenSize are unavailable.
+[t=01:22:49.904681][f=0001204] [Python Interface (V15)] Warning: DrawScreen using fallback screen dimensions.
+[t=01:22:49.904690][f=0001204] [Python Interface (V15)] Warning: DrawText and Spring.DrawText are unavailable.
+[t=01:22:49.922228][f=0001205] [V15] gadget:DrawScreen() ping.
+[t=01:22:49.937793][f=0001205] [V15] gadget:DrawScreen() ping.
+[t=01:22:50.403210][f=0001220] Python Interface (V15): Attempting to connect to 127.0.0.1:12345
+[t=01:22:54.568127][f=0001344] [VSync::SetInterval] interval=4 (standard)
+[t=01:22:55.402766][f=0001370] Python Interface (V15): Attempting to connect to 127.0.0.1:12345
+[t=01:22:59.786203][f=0001501] [V15] gadget:Update() ping. Frame: 1501
+[t=01:22:59.921916][f=0001505] [V15] gadget:DrawScreen() ping.
+[t=01:22:59.921957][f=0001505] [Python Interface (V15)] Warning: GetScreenSize and Spring.GetScreenSize are unavailable.
+[t=01:22:59.921990][f=0001505] [Python Interface (V15)] Warning: DrawScreen using fallback screen dimensions.
+[t=01:22:59.921998][f=0001505] [Python Interface (V15)] Warning: DrawText and Spring.DrawText are unavailable.
+[t=01:23:00.435826][f=0001520] Python Interface (V15): Attempting to connect to 127.0.0.1:12345
+[t=01:23:00.436107][f=0001520] Python Interface (V15): Connected to Python GA server!
+[t=01:23:00.569619][f=0001525] Python Interface (V15): Processing command: GET_STATE
+[t=01:23:00.569711][f=0001525] Error in Update(): [string "LuaUI\Widgets\python_interface.lua"]:150: [GetUnitDefID] unitID (arg #1) not a number
+
+[t=01:23:00.569723][f=0001525] Removed widget: Python GA Interface V15
+[t=01:23:00.569825][f=0001525] [V15] gadget:Shutdown() called.
+[t=01:24:21.436678][f=0003950] Input grabbing is enabled!
+[t=01:24:21.500943][f=0003950] [VSync::SetInterval] interval=-1 (adaptive)
+[t=01:24:24.533988][f=000404
+
+# bar_interface.py
+import socket
+import json
+import time
+import threading # For handling client connection in a separate thread
+
+class BARInterface:
+    def __init__(self, host="127.0.0.1", port=12345):
+        self.host = host
+        self.port = port
+        self.server_socket = None
+        self.client_socket = None
+        self.client_address = None
+        self._lock = threading.Lock() # For thread-safe access to client_socket
+        self.is_connected = False
+        self._stop_event = threading.Event()
+        self._server_thread = None
+
+    def start_server(self):
+        """Starts the server to listen for BAR Lua client."""
+        if self.server_socket:
+            print("Server already running.")
+            return
+
+        self._stop_event.clear()
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # Allow address reuse
+        try:
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(1) # Listen for one connection (the BAR client)
+            print(f"Python BAR Interface: Server listening on {self.host}:{self.port}")
+
+            self._server_thread = threading.Thread(target=self._accept_connections, daemon=True)
+            self._server_thread.start()
+
+        except OSError as e:
+            print(f"Error starting server: {e}. Port {self.port} might be in use.")
+            self.server_socket = None
+            return False
+        return True
+
+    def _accept_connections(self):
+        """Accepts incoming connections from BAR. Runs in a separate thread."""
+        while not self._stop_event.is_set():
+            if not self.server_socket:
+                break
+            try:
+                # Set a timeout on accept so the loop can check _stop_event
+                self.server_socket.settimeout(1.0)
+                conn, addr = self.server_socket.accept()
+                with self._lock:
+                    if self.client_socket: # If there's an old connection, close it
+                        print("Replacing existing BAR client connection.")
+                        self.client_socket.close()
+
+                    self.client_socket = conn
+                    self.client_address = addr
+                    self.is_connected = True
+                    # Set a timeout for read/write operations on the client socket
+                    self.client_socket.settimeout(5.0) # 5 second timeout for operations
+                print(f"Python BAR Interface: Connected to BAR client {addr}")
+
+                # Keep connection alive until a new one comes or server stops
+                while not self._stop_event.is_set() and self.is_connected:
+                    # Check if client_socket is still the current one (could be replaced by a new connection)
+                    with self._lock:
+                        is_current_client = (self.client_socket == conn)
+                    if not is_current_client:
+                        break # A new client has connected, this thread for old client can exit
+
+                    # Optional: Could have a keep-alive ping here if needed,
+                    # but usually relying on receive timeout is fine.
+                    time.sleep(0.5)
+
+
+            except socket.timeout:
+                continue # Timeout allows checking self._stop_event
+            except OSError as e:
+                if not self._stop_event.is_set(): # Don't print error if we are stopping
+                    print(f"Error accepting connection: {e}")
+                break # Exit thread on other OS errors
+            except Exception as e:
+                if not self._stop_event.is_set():
+                    print(f"Unexpected error in _accept_connections: {e}")
+                break
+
+        print("Python BAR Interface: Server thread stopped.")
+        with self._lock: # Ensure client socket is closed on exit
+            if self.client_socket:
+                self.client_socket.close()
+                self.client_socket = None
+            self.is_connected = False
+
+
+    def stop_server(self):
+        """Stops the server and closes connections."""
+        print("Python BAR Interface: Stopping server...")
+        self._stop_event.set()
+        with self._lock:
+            if self.client_socket:
+                try:
+                    self.client_socket.close()
+                except Exception:
+                    pass
+                self.client_socket = None
+            self.is_connected = False
+
+        if self.server_socket:
+            try:
+                # Unblock server_socket.accept() by connecting to it
+                # This is a common way to cleanly shut down a blocking accept
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as temp_sock:
+                    temp_sock.settimeout(0.1) # Don't block for long
+                    try:
+                        temp_sock.connect((self.host, self.port))
+                    except (socket.timeout, ConnectionRefusedError):
+                        pass # Expected if server is already closing
+            except Exception as e:
+                print(f"Exception during server shutdown helper: {e}")
+            finally:
+                self.server_socket.close()
+                self.server_socket = None
+
+        if self._server_thread and self._server_thread.is_alive():
+            self._server_thread.join(timeout=2.0)
+        print("Python BAR Interface: Server stopped.")
+
+
+    def _send_message(self, message_dict):
+        """Sends a JSON message to the BAR client."""
+        with self._lock:
+            if not self.client_socket or not self.is_connected:
+                # print("Error: Not connected to BAR client.")
+                return None # Or raise an exception
+
+        try:
+            json_message = json.dumps(message_dict)
+            self.client_socket.sendall((json_message + "\n").encode('utf-8')) # Add newline
+            # print(f"Sent: {json_message}")
+            return True
+        except (socket.error, BrokenPipeError, ConnectionResetError) as e:
+            print(f"Error sending message: {e}. Disconnecting.")
+            with self._lock:
+                if self.client_socket: self.client_socket.close()
+                self.client_socket = None
+                self.is_connected = False
+            return None
+        except Exception as e:
+            print(f"Unexpected error sending message: {e}")
+            return None
+
+
+    def _receive_message(self, timeout=5.0):
+        """Receives a JSON message from the BAR client."""
+        with self._lock:
+            if not self.client_socket or not self.is_connected:
+                # print("Error: Not connected to BAR client for receive.")
+                return None # Or raise an exception
+
+        buffer = b""
+        try:
+            self.client_socket.settimeout(timeout) # Set timeout for this receive operation
+            while True:
+                chunk = self.client_socket.recv(1024)
+                if not chunk: # Connection closed by client
+                    print("Connection closed by BAR client.")
+                    with self._lock:
+                        if self.client_socket: self.client_socket.close()
+                        self.client_socket = None
+                        self.is_connected = False
+                    return None
+                buffer += chunk
+                # Check if a full line (ending with newline) is received
+                if b"\n" in buffer:
+                    message_str, _, buffer = buffer.partition(b"\n") # Get first full message
+                    # print(f"Received: {message_str.decode('utf-8')}")
+                    return json.loads(message_str.decode('utf-8'))
+        except socket.timeout:
+            print("Timeout receiving message from BAR.")
+            return None
+        except (socket.error, json.JSONDecodeError, ConnectionResetError) as e:
+            print(f"Error receiving or decoding message: {e}. Disconnecting.")
+            with self._lock:
+                if self.client_socket: self.client_socket.close()
+                self.client_socket = None
+                self.is_connected = False
+            return None
+        except Exception as e:
+            print(f"Unexpected error receiving message: {e}")
+            return None
+
+
+    def build_unit(self, unit_name: str, x: float, y: float, wait_for_response=True):
+        """Commands BAR to build a unit."""
+        command = {
+            "command": "BUILD_UNIT",
+            "params": {"unit_name": unit_name, "x": x, "y": y}
+        }
+        if not self._send_message(command):
+            return {"status": "error", "message": "Failed to send build command"}
+
+        if wait_for_response:
+            return self._receive_message()
+        return {"status": "success", "message": "Build command sent (no wait)"}
+
+
+    def get_bar_state(self):
+        """Requests and returns the current game state from BAR."""
+        command = {"command": "GET_STATE"}
+        if not self._send_message(command):
+            return {"status": "error", "message": "Failed to send get_state command"}
+
+        return self._receive_message()
+
+# --- Example Usage (for testing this module directly) ---
+if __name__ == "__main__":
+    bar_iface = BARInterface()
+    if not bar_iface.start_server():
+        print("Could not start BAR interface server. Exiting.")
+        exit()
+
+    print("BAR Interface Server started. Waiting for BAR to connect...")
+    print("Launch BAR with the python_interface.lua gadget enabled.")
+    print("Press Ctrl+C to stop.")
+
+    try:
+        action_counter = 0
+        while True:
+            if bar_iface.is_connected:
+                if action_counter % 20 == 0: # Every 10 seconds approx (0.5s sleep)
+                    print("\nSending BUILD_UNIT command for 'SC' (Solar Collector)...")
+                    # Example coordinates, these might be off-map or invalid.
+                    # The Lua script currently tries to build near commander.
+                    build_response = bar_iface.build_unit("SC", 100.0, 100.0)
+                    print(f"Build Response: {build_response}")
+
+                if action_counter % 10 == 1: # Offset to not always clash with build
+                    print("\nRequesting game state...")
+                    state = bar_iface.get_bar_state()
+                    if state and state.get("status") == "success":
+                        print(f"Game Time: {state.get('game_time', -1):.2f}s, "
+                              f"Metal: {state.get('metal', -1)}, "
+                              f"Energy: {state.get('energy', -1)}")
+                        print(f"Units: {state.get('units', {})}")
+                    else:
+                        print(f"Get State Response: {state}")
+                action_counter += 1
+            else:
+                if action_counter % 10 == 0:
+                     print(f"Waiting for BAR connection... (is BAR running with the gadget?)")
+                action_counter +=1
+
+
+            time.sleep(0.5) # Loop delay
+    except KeyboardInterrupt:
+        print("Keyboard interrupt received.")
+    finally:
+        print("Shutting down BAR interface...")
+        bar_iface.stop_server()
+        print("BAR Interface stopped.")
+
+PS C:\Users\natha\AppData\Local\Programs\Beyond-All-Reason\data\LuaUI\Widgets> & C:/Users/natha/AppData/Local/Programs/Python/Python313/python.exe "c:/Users/natha/OneDrive/Desktop/BAR OPT/bar_interface.py"
+Python BAR Interface: Server listening on 127.0.0.1:12345
+BAR Interface Server started. Waiting for BAR to connect...
+Launch BAR with the python_interface.lua gadget enabled.
+Press Ctrl+C to stop.
+Waiting for BAR connection... (is BAR running with the gadget?)
+Python BAR Interface: Connected to BAR client ('127.0.0.1', 62950)
+
+Requesting game state...
+Connection closed by BAR client.
+Get State Response: None
+Waiting for BAR connection... (is BAR running with the gadget?)
+Waiting for BAR connection... (is BAR running with the gadget?)
+Waiting for BAR connection... (is BAR running with the gadget?)
+Waiting for BAR connection... (is BAR running with the gadget?)
+Waiting for BAR connection... (is BAR running with the gadget?)
+Waiting for BAR connection... (is BAR running with the gadget?)
+Waiting for BAR connection... (is BAR running with the gadget?)
+Waiting for BAR connection... (is BAR running with the gadget?)
+
