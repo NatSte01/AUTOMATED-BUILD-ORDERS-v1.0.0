@@ -112,6 +112,10 @@ The system recognizes different technology tiers:
 
 This project is specifically designed for the Cortex faction in Beyond All Reason. Contributions should maintain compatibility with the existing unit database and optimization algorithms.
 
+Should you have other ideas, such as adding factions, adding more units and buildings, making tech tree robust, and much more. Please submit it so that I can test the program and merge it.
+
+Ultimately I want this program to be a widget, it has a lot more improvements needed and I know most of the code there will be mediocre since I am not a coder. But please let me know if you have suggestions.
+
 ## License
 
 See `LICENSE` file for details.
